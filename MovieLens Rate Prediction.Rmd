@@ -1,0 +1,412 @@
+---
+title: "MovieLens Rate Prediction"
+author: "Alan Bauza"
+date: "6/16/2021"
+output: pdf_document
+---
+
+1.MOVIELENS INTRODUCTION
+
+MovieLens is an online system that recommends movies to its users based on collaborative filter taking into consideration their preferences. GroupLens Research, a research lab that belongs to the University of Minnesota (United States) provides a free access to MovieLens' data set, that contains 10 million ratings, which will be used for this project to predict the movie ratings based on user preference.
+Before that a thorough data analysis will be performed on the data.
+Due to computational limitations and the impossibility to work with the whole data set, I will reduce the data set to be able to perform an analysis, from 9,000,055 items to 90,000 for the training set (renamed "edx_new", before "edx") and from 999,999 items to 10,000 for the validation set (renamed "validation_new", before "validation").
+The end goal of the project is to achieve a system that predicts the rating with a lower value than 0.86490.
+The key steps taken on this project were creating the proper data set, creating new columns with the year and month of rating and year of release, analyzing the different columns and some of their interactions, calculating the RMSE and arriving to a conclusion.
+
+
+2.MOVIELENS ANALYSIS
+
+Installing and/or loading the necessary libraries
+```{r}
+if(!require(tidyverse)) install.packages("tidyverse", 
+                                         repos = "http://cran.us.r-project.org")
+
+if(!require(caret)) install.packages("caret", 
+                                     repos = "http://cran.us.r-project.org")
+
+if(!require(data.table)) install.packages("data.table", 
+                                          repos = "http://cran.us.r-project.org")
+
+if(!require(lubridate)) install.packages("lubridate", 
+                                         repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+
+library(caret)
+
+library(data.table)
+
+library(lubridate)
+```
+
+Downloading the necessary data to a temporary file
+```{r}
+dl <- tempfile()
+
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+```
+
+Building the data set
+```{r}
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                            title = as.character(title),
+                                            genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+Partitioning the initial data with 90% of the info used for the training set, creating the training data set and creating a temporary data set that later will be used to create the validation set
+```{r}
+set.seed(1, sample.kind="Rounding")
+
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+
+edx <- movielens[-test_index,]
+
+temp <- movielens[test_index,]
+```
+
+Creating the validation set and making sure userId and movieId in it are also in the edx set
+```{r}
+validation <- temp %>% 
+      semi_join(edx, by = "movieId") %>%
+      semi_join(edx, by = "userId")
+```
+
+Adding rows removed from validation set back into edx set and removing all unnecessary objects
+```{r}
+removed <- anti_join(temp, validation)
+
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+Extracting fewer values due to computational limitations as explained in the introduction so my computer can process the data and creating the data sets that I will be working with
+```{r}
+edx_new <- sample_n(edx, 90000)
+
+validation_new <- sample_n(validation, 10000)
+```
+
+Checking how the data structure looks like
+```{r}
+head(edx_new)
+```
+
+We can see there are six columns: userId, that contains the Id that is used to identify each specific person that has rated a movie; movieId, that has the Id that represents each specific movie; timestamp, a numerical value of the specific moment in which the movie was rated (It will need to be transformed to a datetime item); title, that has both the name of the movie and the year it was released. Extracting each year would be of value for future analysis;and genres: movies are not necessarily classified into one genre but many, so each row value contains different amounts and types of genres.
+
+Before analysis, I will be transforming different columns for a better examination.
+
+Mutating timestamp into two new columns, one for the year of rating and another for the month of rating to establish comparisons later; and dropping the timestamp column as it is not needed anymore.
+```{r}
+edx_new <- mutate(edx_new, rated_year = year(as_datetime(timestamp)))
+
+edx_new <- mutate(edx_new, rated_month = month(as_datetime(timestamp)))
+
+edx_new <- subset(edx_new, select = -timestamp)
+```
+
+Separating the release date from the title and placing that information in a new column named release
+```{r}
+edx_new <- mutate(edx_new, release = as.numeric(substr(title, nchar(title)-4, 
+                                                       nchar(title)-1)))
+```
+
+Creating a new column named age_rated_movie that will show how many years passed since the movie was released and the year it was rated, to later analyze it
+```{r}
+edx_new <- mutate(edx_new, age_rated_movie = rated_year - release)
+```
+
+Checking how everything looks now
+```{r}
+head(edx_new)
+```
+
+Checking amount of users in the edx_new dataset
+```{r}
+length(unique(edx_new$userId))
+```
+
+Checking amount of movies in the edx_new dataset
+```{r}
+length(unique(edx_new$movieId))
+```
+
+Checking all the different rating values in an ordered manner and the amount in the edx_new dataset
+```{r}
+sort(unique(edx_new$rating), decreasing = FALSE)
+
+length(unique(edx_new$rating))
+```
+We can see 10 ratings that go from 0.5 to 5.0, with 0.5 intervals. There is no 0.0 rating
+
+Checking the amount of genres in the edx_new dataset
+```{r}
+length(unique(edx_new$genres))
+```
+We know after previously inspecting the genres column that each move belongs to more than one genre, so the real value is not actually 668.
+
+Separating the genres in the genres column. Since this will alter the amount of rows and will create more than one review for each real review, I will be creating a new data set named edx_genres with this information not to affect the edx_new data set that will be used for training the model
+```{r}
+edx_genres <- edx_new %>% as.data.frame() %>% separate_rows(genres, sep ="\\|")
+```
+
+Checking the amount of genres in the edx_genres dataset
+```{r}
+length(unique(edx_genres$genres))
+```
+
+Instead of 668 different genres like it was indicated by the genres column in the edx_new data set with mixed genres per row, we see that actually there are 19 genres.
+
+Calculating the range of years of reviews
+```{r}
+range(edx_new$rated_year)
+```
+This data set only contains movies reviewed between 1996 and 2009. 
+
+Calculating the range of years of release
+```{r}
+range(edx_new$release)
+```
+The movies reviewed were released between 1915 and 2008.
+
+Calculating the range of age of rates, the moment between they were released and the moment they were rated
+```{r}
+range(edx_new$age_rated_movie)
+```
+We can see there are -1 ratings which is impossible since it would mean that the movie was rated before it was released. 
+
+Checking which rows are giving -1, ordering the data set by the age_rated_movie in ascending rate
+```{r}
+edx_new[order(edx_new$age_rated_movie),]
+```
+
+We can see it's only the first 3 elements that give a value of -1. It happened with 2 movies, Bliss and Dangerous Ground, that were both released in 1997 and rated in 1996 according to the data set. Further investigation on the movies indicate that they were indeed released in 1997, so the timestamp must be wrong. 
+
+Replacing the -1 age_rated_movie value by 0 and the rated_year one by 1997, which makes more sense 
+```{r}
+edx_new$age_rated_movie[edx_new$age_rated_movie < 0] <- 0
+
+edx_new$rated_year[21220] <- 1997
+
+edx_new$rated_year[44930] <- 1997
+
+edx_new$rated_year[84171] <- 1997
+```
+
+Checking that the changes did take place. The range should be now 0 to 90, and the values of the differences between the rated_year and release for those rows should be 0
+```{r}
+range(edx_new$age_rated_movie)
+
+edx_new$rated_year[21220] - edx_new$release[21220]
+
+edx_new$rated_year[44930] - edx_new$release[44930]
+
+edx_new$rated_year[84171] - edx_new$release[84171]
+```
+All the proper changes took place.
+
+Checking the average of the age of the rated movie when rated
+```{r}
+mean(edx_new$age_rated_movie)
+```
+In average movies were rated after 12 years of their release. Since the rating started in 1996 and there are movies as old as from 1915, this shows many movies had to be reviewed more recently. Let's check if there is a large amount of movies close to the 1996-2009 period (period of review).
+
+Creating a histogram of the amount of movies released per year
+```{r}
+edx_new %>% group_by(release) %>% ggplot(aes(release)) + 
+  geom_bar(fill= "yellow", colour = "black") + 
+  labs(x = "Year of release", y = "Amount of movies", 
+       title = "Amount of movies released per year")
+```
+Like it was supposed previously, from the movies that have been reviewed there is a growing amount of movies released throughout the years with an acceleration in the 80's and a peak in the mid 90's.
+
+Creating a histogram with the amount of ratings per user
+```{r}
+edx_new %>% group_by(userId) %>% dplyr::summarize(n = n()) %>% ggplot(aes(n)) + 
+  geom_bar(fill= "red", colour = "black") + 
+  labs(x ="Amount of ratings", y = "Amount of users", 
+       title = "Amount of ratings per user")
+```
+Most people have done few reviews, and the amount of more than 15 ratings per users are negligible.
+
+Creating a histogram with the amount of movies rated per year
+```{r}
+edx_new %>% group_by(rated_year) %>% ggplot(aes(rated_year)) + 
+  geom_bar(fill= "green", colour = "black") + 
+  labs(x = "Rated year", y = "Amount of movies", 
+       title = "Amount of movies rated per year")
+```
+We see fewer reviews in 1998 and 2009 (for 2009, probably because of the time when the data set was created, but it can't be confirmed) and 3 peaks in 1996, 2000, and 2005. From 1999 to 2009, except for the peaks and the drops in 1998 and 2009, the values are relatively steady around 6000 reviews per year.
+
+Creating a histogram with the amount of movies rated per month
+```{r}
+edx_new %>% group_by(rated_month) %>% ggplot(aes(rated_month)) + 
+  geom_bar(fill= "pink", colour = "black") + 
+  labs(x = "Rated month", y = "Amount of movies", 
+       title = "Amount of movies rated per month")
+```
+We can see a relatively steady amount of reviews from January to August (months 1 to 8), a drop in September (month 9), and an increase at the end of the year(months 10 to 12).
+
+Creating a function to reorder any element, that will be applied to the column genres in edx_genres to plot the amount of movies per genre in a decreasing order
+```{r}
+reorder_size <- function(x) {factor(x, levels = names(sort(table(x))))}
+
+ggplot(edx_genres, aes(reorder_size(genres))) + 
+  geom_bar(fill= "orange", colour = "black") + coord_flip() + 
+  labs(y = "Amount of movies", x = "Genres", title = "Amount of movies per genre")
+```
+Drama, Comedy, Action, Thriller and Adventure are the most popular movies reviewed, and the least are IMAX, Documentary, Film-Noir and Western.
+
+Calculating the average rating
+```{r}
+mean(edx_new$rating)
+```
+The average rating is 3.51 (on a scale that goes up to 5, the higher the ranking, the better).
+
+Creating a rating per movie dataframe with movies and their average mean to calculate how many movies have a perfect rating and how many have the worst one
+```{r}
+rating_per_movie <- edx_new %>% group_by(title) %>% 
+  summarize(movie_rating_mean = mean(rating))
+```
+
+Checking all the movies with a perfect rating
+```{r}
+length(rating_per_movie$title[rating_per_movie$movie_rating_mean == 5])
+```
+There are 130 movies with perfect rating.
+
+Checking all the movies with the worst rating
+```{r}
+length(rating_per_movie$title[rating_per_movie$movie_rating_mean == 0.5])
+```
+There are 46 movies with the worst possible rating.
+
+Creating a histogram of the rating average per genre
+```{r}
+rating_per_genre <- edx_genres %>% group_by(genres) %>% 
+  summarize(genre_rating_mean = mean(rating))
+
+ggplot(rating_per_genre, aes(reorder(genres, genre_rating_mean), genre_rating_mean)) + 
+  geom_bar(fill= "pink", colour = "black", stat = "identity") + coord_flip() + 
+  labs(y = "Rating average", x = "Genres", title = "Rating average per genre")
+```
+The three best rated are Film-Noir, Documentary and War, and the three worst, Horror, Children and Sci-Fi.
+
+Creating a scatter plot with the rating average per release year
+```{r}
+rating_per_release <- edx_new %>% group_by(release) %>% 
+  summarize(release_rating_mean = mean(rating))
+
+ggplot(rating_per_release, aes(release, release_rating_mean)) + 
+  geom_point(stat = "identity") + 
+  labs(y = "Rating average", x = "Release year", 
+       title = "Rating average per release year")
+```
+We can see that the rating averages vary less and less with time and they become more stable towards the average rating of 3.51.
+
+Creating a scatter plot with the rating average per age of rating
+```{r}
+rating_per_age_rated <- edx_new %>% group_by(age_rated_movie) %>% 
+  summarize(age_rated_rating_mean = mean(rating))
+
+ggplot(rating_per_age_rated, aes(age_rated_movie, age_rated_rating_mean)) + 
+  geom_point(stat = "identity") + 
+  labs(y = "Rating average", x = "Years ago released when rating", 
+       title = "Rating average per age of rating") + 
+  scale_x_reverse()
+```
+We see the same behavior as in the previous image, the older the age of ratings, the more it varies.
+
+Creating a scatter plot with the rating average per year of rating
+```{r}
+rating_per_year_rating <- edx_new %>% group_by(rated_year) %>% 
+  summarize(year_rated_rating_mean = mean(rating))
+
+ggplot(rating_per_year_rating, aes(rated_year, year_rated_rating_mean)) + 
+  geom_point(stat = "identity") + 
+  labs(y = "Rating average", x = "Rated year", 
+       title = "Rating average per year of rating")
+```
+All the values are close to the average, 3.51. In general, they first tend to go upwards, then downwards, then upwards again, but these changes are actually minuscule.
+
+Creating a scatter plot with the rating average per month of rating
+```{r}
+rating_per_month_rating <- edx_new %>% group_by(rated_month) %>% 
+  summarize(month_rated_rating_mean = mean(rating))
+
+ggplot(rating_per_month_rating, aes(rated_month, month_rated_rating_mean)) + 
+  geom_point(stat = "identity") + labs(y = "Rating average", x = "Rated month", 
+                                       title = "Rating average per month of rating")
+```
+Again the values are close to the average and they don't seem to follow a clear trend.
+
+
+The model approach will be the following:
+An RMSE formula will be created to calculate how concentrated the data is around the line of best fit. After that, we will be checking the tuning value of the lambda for the final calculation. Lambdas from 0 to 6 will be chosen with an interval of 0.1. The formula to best calculate the RMSEs values is Yu,i= mu+bi+bu. Mu assumes that all the movies and users will have the same value (average of ratings), bi the average rating for any movie "i", and bu the user specific effect. The lowest value of lambda will be used to calculate both bi and bu. After getting the proper lambda for the model, the same formula will be applied to the validation set to calculate the RMSE. The ideal value should be less than 0.86490, which means the predicted average rating of all movies put together will be less than 0.8690 points away (from a rating possibility that goes from 0.5 to 5) from the actual average rating.
+
+
+3. RESULTS
+
+Creating the RMSE formula
+```{r}
+RMSE <- function(actual_ratings, predicted_ratings){
+  sqrt(mean((actual_ratings - predicted_ratings)^2))
+}
+```
+
+
+Calculating the best lambda and plotting a graph to visualize it better
+```{r}
+Lambdas <- seq(0, 6, 0.1)
+
+RMSEs <- sapply(Lambdas, function(l){
+  mu <- mean(edx_new$rating)
+  
+  bi <- edx_new %>% group_by(movieId) %>%
+    dplyr::summarize(bi = sum(rating - mu)/(n() + l))
+  
+  bu <- edx_new %>% left_join(bi, by='movieId') %>% 
+    group_by(userId) %>% dplyr::summarize(bu = sum(rating - bi - mu)/(n() +l))
+  
+  predicted_ratings <- edx_new %>% left_join(bi, by = "movieId") %>%
+    left_join(bu, by = "userId") %>% mutate(pred = mu + bi +  bu) %>% .$pred
+  
+  return(RMSE(predicted_ratings, edx_new$rating))
+})
+
+qplot(Lambdas, RMSEs)
+```
+Since the RMSEs increase as the lambdas do, the smaller the lambda, the better the result that will be obtained. We will use a lambda of 0.01.
+
+Calculating the final RMSE
+```{r}
+mu <- mean(validation$rating)
+
+l <- 0.01
+
+bi <- validation %>% group_by(movieId) %>% 
+  dplyr::summarize(bi = sum(rating - mu)/(n() + l))
+  
+bu <- validation %>% left_join(bi, by='movieId') %>% group_by(userId) %>%
+    dplyr::summarize(bu = sum(rating - bi - mu)/(n() +l))
+  
+predicted_ratings <- validation %>% left_join(bi, by = "movieId") %>%
+    left_join(bu, by = "userId") %>% mutate(pred = mu + bi +  bu) %>% .$pred
+
+RMSE(predicted_ratings, validation$rating)
+```
+The result of the RMSE applied to the validation set is 0.8251719, which falls under the desired range of less than 0.86490, by 0.039721. The model applied here achieved the expected results.
+
+
+4. CONCLUSION
+
+As we have seen, the results gotten were under the value of 0.86490, which was the best possible result. The final goal was achieved, but do to computational restrictions I was forced to reduce the sample in order to be able to do any work at all.
